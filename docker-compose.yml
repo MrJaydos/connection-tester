@@ -1,0 +1,22 @@
+services:
+  connection-tester:
+    build: .
+    # If you'd rather pull a prebuilt image than build in Coolify, comment out
+    # "build: ." above and set "image:" to your registry image instead.
+    restart: unless-stopped
+    environment:
+      # --- required ---
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      # --- optional (defaults shown) ---
+      TZ: ${TZ:-UTC}
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-5}
+      CHECK_TIMEOUT: ${CHECK_TIMEOUT:-1.5}
+      FAIL_THRESHOLD: ${FAIL_THRESHOLD:-3}
+      TARGETS: ${TARGETS:-1.1.1.1:443,8.8.8.8:53}
+      STARTUP_PING: ${STARTUP_PING:-true}
+    volumes:
+      - tester-data:/data
+
+volumes:
+  tester-data:
