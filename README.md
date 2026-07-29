@@ -58,7 +58,7 @@ You now have `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 
 ## 2. Deploy on Coolify
 
-This repo has a `Dockerfile` and a `docker-compose.yml`, so Coolify can deploy
+This repo has a `Dockerfile` and a `docker-compose.yaml`, so Coolify can deploy
 it either way.
 
 **Option A — Docker Compose (recommended):**
