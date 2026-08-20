@@ -25,6 +25,17 @@ back on a slower **4G backup** instead of your main line:
 for a fibre main line. Set it to your own speed, or `0` to just get the raw
 number. See the config table below.)
 
+You can also **message the bot on demand** — send it any of these commands and
+it replies:
+
+- `/speedtest` — run a download speed test right now
+- `/status` — is the connection up at the moment?
+- `/help` — list the commands
+
+(Only messages from your `TELEGRAM_CHAT_ID` are acted on; anything else is
+ignored. Commands only work while you're online — during an outage the box has
+no route out to Telegram.)
+
 There are two ways to run it:
 
 - **`monitor.py` + Docker** — the containerized monitor with Telegram alerts,
@@ -136,6 +147,7 @@ docker run -d --restart unless-stopped \
 | `SPEED_TEST_BYTES`   |    no    | `10000000`          | Hard cap on bytes downloaded (keeps it cheap on metered 4G).       |
 | `SPEED_TEST_TIMEOUT` |    no    | `30`                | Overall timeout for the speed test (seconds).                     |
 | `SPEED_TEST_SLOW_MBPS` |  no    | `100`               | Flag the result as "probably the 4G backup" if below this many Mbps (default suits a fibre line). `0` disables the warning. |
+| `LISTEN_COMMANDS`    |    no    | `true`              | Reply to `/speedtest`, `/status`, `/help` messaged to the bot (from `TELEGRAM_CHAT_ID` only). |
 
 With the defaults, an outage has to persist for roughly `FAIL_THRESHOLD ×
 INTERVAL_SECONDS` (≈ 15s) before it's counted — tune those down for a twitchier
