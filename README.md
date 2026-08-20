@@ -153,7 +153,8 @@ docker run -d --restart unless-stopped \
 | `SPEED_TEST`         |    no    | `true`              | Run a ping/download/upload speed test after recovery and send it as a second message. |
 | `SPEED_TEST_URL`     |    no    | `https://speed.cloudflare.com/__down?bytes=100000000` | File to download for the measurement. |
 | `SPEED_TEST_BYTES`   |    no    | `100000000`         | How much to download, in bytes (100 MB). Streamed and discarded — not stored. |
-| `SPEED_TEST_TIMEOUT` |    no    | `120`               | Timeout for each part of the speed test (seconds).                |
+| `SPEED_TEST_MAX_REQUEST_BYTES` | no | `25000000`      | Max bytes per download request; a bigger `SPEED_TEST_BYTES` is fetched in several requests and summed (Cloudflare 403s very large single downloads). |
+| `SPEED_TEST_TIMEOUT` |    no    | `120`               | Timeout for the whole download, and for upload (seconds).         |
 | `SPEED_TEST_PING`    |    no    | `true`              | Include a ping (TCP-connect latency) measurement.                 |
 | `SPEED_TEST_PING_HOST` | no     | `1.1.1.1:443`       | `host:port` to time the TCP connect against for ping.             |
 | `SPEED_TEST_UPLOAD`  |    no    | `true`              | Include an upload measurement (POST to Cloudflare).               |
