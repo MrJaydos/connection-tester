@@ -57,6 +57,21 @@ FAIL_THRESHOLD = int(env("FAIL_THRESHOLD", "3"))
 STATE_FILE = env("STATE_FILE", "/data/state.json")
 STARTUP_PING = env_bool("STARTUP_PING", True)
 
+# After the connection recovers, measure download throughput. Handy for spotting
+# when you've dropped onto a slower 4G backup line instead of your main WAN.
+SPEED_TEST = env_bool("SPEED_TEST", True)
+# A file to download for the measurement. Cloudflare's endpoint lets you ask for
+# an exact number of bytes and has no auth. Reads are capped at SPEED_TEST_BYTES
+# regardless, so this stays cheap even on a metered 4G backup.
+SPEED_TEST_URL = env("SPEED_TEST_URL", "https://speed.cloudflare.com/__down?bytes=10000000")
+SPEED_TEST_BYTES = int(env("SPEED_TEST_BYTES", "10000000"))  # ~10 MB
+SPEED_TEST_TIMEOUT = float(env("SPEED_TEST_TIMEOUT", "30"))
+# If the measured speed is below this (Mbps), flag it as "probably the 4G backup".
+# Defaults to 100: a fibre main line sits well above it and a 4G backup well
+# below, so a recovery on the backup gets flagged. Set to 0 to disable the
+# warning (you still get the raw number).
+SPEED_TEST_SLOW_MBPS = float(env("SPEED_TEST_SLOW_MBPS", "100"))
+
 
 def log(message):
     stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -177,6 +192,52 @@ def fmt(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def run_speed_test():
+    """
+    Roughly measure download throughput by fetching a file and timing it.
+
+    Returns (mbps, bytes_read, seconds) or None if the test could not be run.
+    Reads at most SPEED_TEST_BYTES so it stays cheap on a metered 4G backup.
+    """
+    try:
+        req = request.Request(SPEED_TEST_URL, headers={"User-Agent": "connection-tester/1.0"})
+        start = time.monotonic()
+        read = 0
+        with request.urlopen(req, timeout=SPEED_TEST_TIMEOUT) as resp:
+            while read < SPEED_TEST_BYTES:
+                chunk = resp.read(min(65536, SPEED_TEST_BYTES - read))
+                if not chunk:
+                    break
+                read += len(chunk)
+        elapsed = time.monotonic() - start
+    except (error.URLError, OSError, ValueError) as exc:
+        log(f"Speed test failed: {exc}")
+        return None
+
+    if read == 0 or elapsed <= 0:
+        log("Speed test produced no usable data.")
+        return None
+
+    mbps = (read * 8) / elapsed / 1_000_000
+    return mbps, read, elapsed
+
+
+def speed_test_message(result):
+    mbps, read, elapsed = result
+    megabytes = read / 1_000_000
+    text = (
+        "📶 <b>Speed test after recovery</b>\n\n"
+        f"Download: <b>{mbps:.1f} Mbps</b>\n"
+        f"({megabytes:.1f} MB in {elapsed:.1f}s)"
+    )
+    if SPEED_TEST_SLOW_MBPS > 0 and mbps < SPEED_TEST_SLOW_MBPS:
+        text += (
+            f"\n\n⚠️ That's below <b>{SPEED_TEST_SLOW_MBPS:.0f} Mbps</b> — "
+            "you may be on the 4G backup rather than your main line."
+        )
+    return text
+
+
 def recovery_message(down_since, back_at):
     duration = human_duration(back_at - down_since)
     return (
@@ -194,6 +255,11 @@ def main():
     log("Connection monitor starting.")
     log(f"Targets: {', '.join(TARGETS)}")
     log(f"Interval: {INTERVAL_SECONDS}s | timeout: {CHECK_TIMEOUT}s | fail threshold: {FAIL_THRESHOLD}")
+    if SPEED_TEST:
+        log(f"Post-recovery speed test: on (up to {SPEED_TEST_BYTES / 1_000_000:.0f} MB "
+            f"from {SPEED_TEST_URL}).")
+    else:
+        log("Post-recovery speed test: off.")
 
     if not BOT_TOKEN or not CHAT_ID:
         log("WARNING: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID are not set. "
@@ -231,6 +297,22 @@ def main():
                     log("Recovery message delivered to Telegram.")
                 else:
                     log("Failed to deliver recovery message after retries.")
+
+                # Sometimes the link comes back on the 4G backup rather than the
+                # main WAN. Measure the speed and report it as a separate message.
+                if SPEED_TEST:
+                    log("Running post-recovery speed test...")
+                    result = run_speed_test()
+                    if result:
+                        log(f"Speed test: {result[0]:.1f} Mbps "
+                            f"({result[1] / 1_000_000:.1f} MB in {result[2]:.1f}s).")
+                        if telegram_send(speed_test_message(result)):
+                            log("Speed test message delivered to Telegram.")
+                        else:
+                            log("Failed to deliver speed test message after retries.")
+                    else:
+                        log("Speed test could not be completed.")
+
                 down_since = None
                 clear_state()
             consecutive_fails = 0

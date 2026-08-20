@@ -10,6 +10,21 @@ down, and that it's back:
 > was down for **4m 27s**,
 > and is now back up and running as of **2026-07-25 14:07:38 BST**.
 
+It can also run a **download speed test the moment the connection returns** and
+send the result as a second message — handy for catching when the link has come
+back on a slower **4G backup** instead of your main line:
+
+> 📶 **Speed test after recovery**
+>
+> Download: **12.3 Mbps**
+> (5.0 MB in 3.2s)
+>
+> ⚠️ That's below **50 Mbps** — you may be on the 4G backup rather than your main line.
+
+(The warning fires below `SPEED_TEST_SLOW_MBPS`, which defaults to `100` — right
+for a fibre main line. Set it to your own speed, or `0` to just get the raw
+number. See the config table below.)
+
 There are two ways to run it:
 
 - **`monitor.py` + Docker** — the containerized monitor with Telegram alerts,
@@ -116,6 +131,11 @@ docker run -d --restart unless-stopped \
 | `TARGETS`            |    no    | `1.1.1.1:443,8.8.8.8:53` | Comma-separated `host:port` TCP probes. Online = any one connects. |
 | `STARTUP_PING`       |    no    | `true`              | Send a short "monitor is online" message on startup.              |
 | `STATE_FILE`         |    no    | `/data/state.json`  | Where outage state is persisted across restarts.                  |
+| `SPEED_TEST`         |    no    | `true`              | Run a download speed test after recovery and send it as a second message. |
+| `SPEED_TEST_URL`     |    no    | `https://speed.cloudflare.com/__down?bytes=10000000` | File to download for the measurement. |
+| `SPEED_TEST_BYTES`   |    no    | `10000000`          | Hard cap on bytes downloaded (keeps it cheap on metered 4G).       |
+| `SPEED_TEST_TIMEOUT` |    no    | `30`                | Overall timeout for the speed test (seconds).                     |
+| `SPEED_TEST_SLOW_MBPS` |  no    | `100`               | Flag the result as "probably the 4G backup" if below this many Mbps (default suits a fibre line). `0` disables the warning. |
 
 With the defaults, an outage has to persist for roughly `FAIL_THRESHOLD ×
 INTERVAL_SECONDS` (≈ 15s) before it's counted — tune those down for a twitchier
