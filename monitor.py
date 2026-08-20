@@ -57,16 +57,34 @@ FAIL_THRESHOLD = int(env("FAIL_THRESHOLD", "3"))
 STATE_FILE = env("STATE_FILE", "/data/state.json")
 STARTUP_PING = env_bool("STARTUP_PING", True)
 
-# After the connection recovers, measure download throughput. Handy for spotting
-# when you've dropped onto a slower 4G backup line instead of your main WAN.
+# After the connection recovers, measure your connection (ping, download and
+# upload). Handy for spotting when you've dropped onto a slower 4G backup line
+# instead of your main WAN. The same test runs on demand via /speedtest.
 SPEED_TEST = env_bool("SPEED_TEST", True)
+
+# --- Download ---
 # A file to download for the measurement. Cloudflare's endpoint lets you ask for
-# an exact number of bytes and has no auth. Reads are capped at SPEED_TEST_BYTES
-# regardless, so this stays cheap even on a metered 4G backup.
-SPEED_TEST_URL = env("SPEED_TEST_URL", "https://speed.cloudflare.com/__down?bytes=10000000")
-SPEED_TEST_BYTES = int(env("SPEED_TEST_BYTES", "10000000"))  # ~10 MB
-SPEED_TEST_TIMEOUT = float(env("SPEED_TEST_TIMEOUT", "30"))
-# If the measured speed is below this (Mbps), flag it as "probably the 4G backup".
+# an exact number of bytes and has no auth. The data is streamed in small chunks
+# and only counted -- it is never written to disk, and only one chunk is held in
+# memory at a time, so a big size costs bandwidth (careful on metered 4G) but not
+# storage or RAM.
+SPEED_TEST_URL = env("SPEED_TEST_URL", "https://speed.cloudflare.com/__down?bytes=100000000")
+SPEED_TEST_BYTES = int(env("SPEED_TEST_BYTES", "100000000"))  # 100 MB
+SPEED_TEST_TIMEOUT = float(env("SPEED_TEST_TIMEOUT", "120"))
+
+# --- Ping (TCP-connect latency) ---
+SPEED_TEST_PING = env_bool("SPEED_TEST_PING", True)
+SPEED_TEST_PING_HOST = env("SPEED_TEST_PING_HOST", "1.1.1.1:443")
+SPEED_TEST_PING_SAMPLES = int(env("SPEED_TEST_PING_SAMPLES", "5"))
+
+# --- Upload ---
+# Uploads a throwaway in-memory buffer to Cloudflare's __up endpoint and times
+# it. The buffer is freed as soon as the request finishes.
+SPEED_TEST_UPLOAD = env_bool("SPEED_TEST_UPLOAD", True)
+SPEED_TEST_UPLOAD_URL = env("SPEED_TEST_UPLOAD_URL", "https://speed.cloudflare.com/__up")
+SPEED_TEST_UPLOAD_BYTES = int(env("SPEED_TEST_UPLOAD_BYTES", "20000000"))  # 20 MB
+
+# If the measured download is below this (Mbps), flag it as "probably the 4G backup".
 # Defaults to 100: a fibre main line sits well above it and a 4G backup well
 # below, so a recovery on the backup gets flagged. Set to 0 to disable the
 # warning (you still get the raw number).
@@ -220,12 +238,38 @@ def fmt(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def run_speed_test():
+def measure_ping():
     """
-    Roughly measure download throughput by fetching a file and timing it.
+    Average TCP-connect latency to SPEED_TEST_PING_HOST.
 
-    Returns (mbps, bytes_read, seconds) or None if the test could not be run.
-    Reads at most SPEED_TEST_BYTES so it stays cheap on a metered 4G backup.
+    Returns (avg_ms, min_ms, samples) or None. A TCP connect is ~one round trip,
+    which is a good stand-in for ping without needing raw sockets / root.
+    """
+    host, _, port = SPEED_TEST_PING_HOST.rpartition(":")
+    if not host:  # no port given
+        host, port = SPEED_TEST_PING_HOST, "443"
+    times = []
+    for _ in range(max(1, SPEED_TEST_PING_SAMPLES)):
+        try:
+            start = time.monotonic()
+            with socket.create_connection((host, int(port)), timeout=CHECK_TIMEOUT):
+                pass
+            times.append((time.monotonic() - start) * 1000)
+        except (OSError, ValueError):
+            continue
+    if not times:
+        log("Ping test produced no usable samples.")
+        return None
+    return sum(times) / len(times), min(times), len(times)
+
+
+def measure_download():
+    """
+    Measure download throughput by fetching a file and timing it.
+
+    Returns (mbps, bytes_read, seconds) or None. The stream is read in small
+    chunks and discarded as it arrives -- nothing is written to disk and only
+    one chunk is held in memory at a time, so SPEED_TEST_BYTES can be large.
     """
     try:
         req = request.Request(SPEED_TEST_URL, headers={"User-Agent": "connection-tester/1.0"})
@@ -236,29 +280,106 @@ def run_speed_test():
                 chunk = resp.read(min(65536, SPEED_TEST_BYTES - read))
                 if not chunk:
                     break
-                read += len(chunk)
+                read += len(chunk)  # count only; the chunk is discarded here
         elapsed = time.monotonic() - start
     except (error.URLError, OSError, ValueError) as exc:
-        log(f"Speed test failed: {exc}")
+        log(f"Download test failed: {exc}")
         return None
 
     if read == 0 or elapsed <= 0:
-        log("Speed test produced no usable data.")
+        log("Download test produced no usable data.")
+        return None
+    return (read * 8) / elapsed / 1_000_000, read, elapsed
+
+
+def measure_upload():
+    """
+    Measure upload throughput by POSTing a throwaway buffer and timing it.
+
+    Returns (mbps, bytes_sent, seconds) or None. The buffer is generated in
+    memory and freed as soon as the request finishes.
+    """
+    try:
+        payload = os.urandom(SPEED_TEST_UPLOAD_BYTES)
+        req = request.Request(
+            SPEED_TEST_UPLOAD_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "User-Agent": "connection-tester/1.0",
+            },
+        )
+        start = time.monotonic()
+        with request.urlopen(req, timeout=SPEED_TEST_TIMEOUT) as resp:
+            resp.read()
+        elapsed = time.monotonic() - start
+    except (error.URLError, OSError, ValueError) as exc:
+        log(f"Upload test failed: {exc}")
         return None
 
-    mbps = (read * 8) / elapsed / 1_000_000
-    return mbps, read, elapsed
+    if elapsed <= 0:
+        return None
+    return (len(payload) * 8) / elapsed / 1_000_000, len(payload), elapsed
 
 
-def speed_test_message(result, title="Speed test after recovery"):
-    mbps, read, elapsed = result
-    megabytes = read / 1_000_000
-    text = (
-        f"📶 <b>{title}</b>\n\n"
-        f"Download: <b>{mbps:.1f} Mbps</b>\n"
-        f"({megabytes:.1f} MB in {elapsed:.1f}s)"
-    )
-    if SPEED_TEST_SLOW_MBPS > 0 and mbps < SPEED_TEST_SLOW_MBPS:
+def run_speed_test():
+    """
+    Run the enabled parts of the speed test: ping, download and upload.
+
+    Returns a dict {"ping": ..., "download": ..., "upload": ...} where each value
+    is a result tuple (see the measure_* functions) or None. Returns None only if
+    every enabled part failed.
+    """
+    results = {
+        "ping": measure_ping() if SPEED_TEST_PING else None,
+        "download": measure_download(),
+        "upload": measure_upload() if SPEED_TEST_UPLOAD else None,
+    }
+    if all(v is None for v in results.values()):
+        return None
+    return results
+
+
+def summarize_speed(results):
+    """One-line summary of a speed-test result dict, for the logs."""
+    parts = []
+    if results.get("ping"):
+        parts.append(f"ping {results['ping'][0]:.0f}ms")
+    if results.get("download"):
+        parts.append(f"down {results['download'][0]:.1f}Mbps")
+    if results.get("upload"):
+        parts.append(f"up {results['upload'][0]:.1f}Mbps")
+    return ", ".join(parts) or "no data"
+
+
+def speed_test_message(results, title="Speed test after recovery"):
+    lines = [f"📶 <b>{title}</b>", ""]
+
+    if SPEED_TEST_PING:
+        ping = results.get("ping")
+        if ping:
+            lines.append(f"🏓 Ping: <b>{ping[0]:.0f} ms</b> (min {ping[1]:.0f} ms)")
+        else:
+            lines.append("🏓 Ping: <i>n/a</i>")
+
+    download = results.get("download")
+    if download:
+        mbps, read, elapsed = download
+        lines.append(f"⬇️ Download: <b>{mbps:.1f} Mbps</b> ({read / 1_000_000:.0f} MB in {elapsed:.1f}s)")
+    else:
+        lines.append("⬇️ Download: <i>n/a</i>")
+
+    if SPEED_TEST_UPLOAD:
+        upload = results.get("upload")
+        if upload:
+            mbps, sent, elapsed = upload
+            lines.append(f"⬆️ Upload: <b>{mbps:.1f} Mbps</b> ({sent / 1_000_000:.0f} MB in {elapsed:.1f}s)")
+        else:
+            lines.append("⬆️ Upload: <i>n/a</i>")
+
+    text = "\n".join(lines)
+    if download and SPEED_TEST_SLOW_MBPS > 0 and download[0] < SPEED_TEST_SLOW_MBPS:
         text += (
             f"\n\n⚠️ That's below <b>{SPEED_TEST_SLOW_MBPS:.0f} Mbps</b> — "
             "you may be on the 4G backup rather than your main line."
@@ -313,7 +434,7 @@ def run_command_speed_test():
     telegram_send("⏳ Running a speed test, one moment...", retries=2, backoff=3)
     result = run_speed_test()
     if result:
-        log(f"On-demand speed test: {result[0]:.1f} Mbps.")
+        log(f"On-demand speed test: {summarize_speed(result)}.")
         telegram_send(speed_test_message(result, title="Speed test"))
     else:
         telegram_send("⚠️ Speed test could not be completed. Please try again in a moment.")
@@ -369,8 +490,13 @@ def main():
     log(f"Targets: {', '.join(TARGETS)}")
     log(f"Interval: {INTERVAL_SECONDS}s | timeout: {CHECK_TIMEOUT}s | fail threshold: {FAIL_THRESHOLD}")
     if SPEED_TEST:
-        log(f"Post-recovery speed test: on (up to {SPEED_TEST_BYTES / 1_000_000:.0f} MB "
-            f"from {SPEED_TEST_URL}).")
+        parts = []
+        if SPEED_TEST_PING:
+            parts.append("ping")
+        parts.append(f"{SPEED_TEST_BYTES / 1_000_000:.0f} MB download")
+        if SPEED_TEST_UPLOAD:
+            parts.append(f"{SPEED_TEST_UPLOAD_BYTES / 1_000_000:.0f} MB upload")
+        log(f"Post-recovery speed test: on ({', '.join(parts)}).")
     else:
         log("Post-recovery speed test: off.")
     if LISTEN_COMMANDS:
@@ -428,8 +554,7 @@ def main():
                     log("Running post-recovery speed test...")
                     result = run_speed_test()
                     if result:
-                        log(f"Speed test: {result[0]:.1f} Mbps "
-                            f"({result[1] / 1_000_000:.1f} MB in {result[2]:.1f}s).")
+                        log(f"Speed test: {summarize_speed(result)}.")
                         if telegram_send(speed_test_message(result)):
                             log("Speed test message delivered to Telegram.")
                         else:
