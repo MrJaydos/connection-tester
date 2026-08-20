@@ -15,6 +15,16 @@ services:
       FAIL_THRESHOLD: ${FAIL_THRESHOLD:-3}
       TARGETS: ${TARGETS:-1.1.1.1:443,8.8.8.8:53}
       STARTUP_PING: ${STARTUP_PING:-true}
+      # --- post-recovery speed test (hardcoded; no Coolify vars needed) ---
+      # Runs a download speed test when the link returns and sends it as a
+      # second Telegram message, so a recovery on the slow 4G backup is obvious.
+      SPEED_TEST: "true"
+      SPEED_TEST_URL: "https://speed.cloudflare.com/__down?bytes=10000000"
+      SPEED_TEST_BYTES: "10000000"
+      SPEED_TEST_TIMEOUT: "30"
+      # Fibre line ~500+ Mbps, so anything under 100 Mbps is almost certainly
+      # the 4G backup -- flag it. Bump this up if you ever want a stricter check.
+      SPEED_TEST_SLOW_MBPS: "100"
     volumes:
       - tester-data:/data
 

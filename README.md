@@ -21,8 +21,9 @@ back on a slower **4G backup** instead of your main line:
 >
 > ⚠️ That's below **50 Mbps** — you may be on the 4G backup rather than your main line.
 
-(Set `SPEED_TEST_SLOW_MBPS` to your rough main-line speed to get that warning;
-the raw number is always sent. See the config table below.)
+(The warning fires below `SPEED_TEST_SLOW_MBPS`, which defaults to `100` — right
+for a fibre main line. Set it to your own speed, or `0` to just get the raw
+number. See the config table below.)
 
 There are two ways to run it:
 
@@ -134,7 +135,7 @@ docker run -d --restart unless-stopped \
 | `SPEED_TEST_URL`     |    no    | `https://speed.cloudflare.com/__down?bytes=10000000` | File to download for the measurement. |
 | `SPEED_TEST_BYTES`   |    no    | `10000000`          | Hard cap on bytes downloaded (keeps it cheap on metered 4G).       |
 | `SPEED_TEST_TIMEOUT` |    no    | `30`                | Overall timeout for the speed test (seconds).                     |
-| `SPEED_TEST_SLOW_MBPS` |  no    | `0`                 | Flag the result as "probably the 4G backup" if below this many Mbps. `0` disables the warning. |
+| `SPEED_TEST_SLOW_MBPS` |  no    | `100`               | Flag the result as "probably the 4G backup" if below this many Mbps (default suits a fibre line). `0` disables the warning. |
 
 With the defaults, an outage has to persist for roughly `FAIL_THRESHOLD ×
 INTERVAL_SECONDS` (≈ 15s) before it's counted — tune those down for a twitchier

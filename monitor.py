@@ -67,8 +67,10 @@ SPEED_TEST_URL = env("SPEED_TEST_URL", "https://speed.cloudflare.com/__down?byte
 SPEED_TEST_BYTES = int(env("SPEED_TEST_BYTES", "10000000"))  # ~10 MB
 SPEED_TEST_TIMEOUT = float(env("SPEED_TEST_TIMEOUT", "30"))
 # If the measured speed is below this (Mbps), flag it as "probably the 4G backup".
-# 0 disables the warning (you still get the raw number).
-SPEED_TEST_SLOW_MBPS = float(env("SPEED_TEST_SLOW_MBPS", "0"))
+# Defaults to 100: a fibre main line sits well above it and a 4G backup well
+# below, so a recovery on the backup gets flagged. Set to 0 to disable the
+# warning (you still get the raw number).
+SPEED_TEST_SLOW_MBPS = float(env("SPEED_TEST_SLOW_MBPS", "100"))
 
 
 def log(message):
