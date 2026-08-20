@@ -19,6 +19,7 @@ Everything is configured through environment variables (see README / .env.exampl
 No third-party packages required -- standard library only.
 """
 
+import http.client
 import json
 import os
 import socket
@@ -263,33 +264,72 @@ def measure_ping():
     return sum(times) / len(times), min(times), len(times)
 
 
-def measure_download():
+def _download_once(url, cap):
     """
-    Measure download throughput by fetching a file and timing it.
+    Download up to `cap` bytes from `url`, timing it.
 
-    Returns (mbps, bytes_read, seconds) or None. The stream is read in small
-    chunks and discarded as it arrives -- nothing is written to disk and only
-    one chunk is held in memory at a time, so SPEED_TEST_BYTES can be large.
+    Returns (result, error) where result is (mbps, bytes_read, seconds) or None,
+    and error is the exception that stopped us (or None). The stream is read in
+    small chunks and discarded as it arrives -- nothing is written to disk and
+    only one chunk is held in memory at a time, so `cap` can be large.
+
+    A large download is easily interrupted (a connection reset or stall,
+    especially just after the link recovers). Rather than throwing the whole
+    thing away, we measure whatever we managed to pull as long as it's a
+    meaningful sample, and stop once we hit the SPEED_TEST_TIMEOUT time budget.
     """
+    read = 0
+    start = time.monotonic()
+    deadline = start + SPEED_TEST_TIMEOUT
     try:
-        req = request.Request(SPEED_TEST_URL, headers={"User-Agent": "connection-tester/1.0"})
-        start = time.monotonic()
-        read = 0
+        req = request.Request(url, headers={"User-Agent": "connection-tester/1.0"})
         with request.urlopen(req, timeout=SPEED_TEST_TIMEOUT) as resp:
-            while read < SPEED_TEST_BYTES:
-                chunk = resp.read(min(65536, SPEED_TEST_BYTES - read))
+            while read < cap:
+                chunk = resp.read(min(65536, cap - read))
                 if not chunk:
                     break
                 read += len(chunk)  # count only; the chunk is discarded here
-        elapsed = time.monotonic() - start
-    except (error.URLError, OSError, ValueError) as exc:
-        log(f"Download test failed: {exc}")
-        return None
+                if time.monotonic() >= deadline:
+                    break  # out of time budget -- measure what we've got
+    except (error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+        # Enough for a sample despite the error? Use it. Otherwise report back.
+        if read < 1_000_000:
+            return None, exc
+        log(f"Download test interrupted after {read / 1_000_000:.0f} MB "
+            f"({exc}); using partial sample.")
 
+    elapsed = time.monotonic() - start
     if read == 0 or elapsed <= 0:
+        return None, None
+    return ((read * 8) / elapsed / 1_000_000, read, elapsed), None
+
+
+def measure_download():
+    """
+    Measure download throughput. Returns (mbps, bytes_read, seconds) or None.
+
+    Tries the configured SPEED_TEST_URL first. Some endpoints reject very large
+    byte counts, so if that yields nothing we retry once with a smaller
+    known-good Cloudflare request rather than reporting "n/a".
+    """
+    result, exc = _download_once(SPEED_TEST_URL, SPEED_TEST_BYTES)
+    if result:
+        return result
+
+    fallback_bytes = 25_000_000  # 25 MB
+    if SPEED_TEST_BYTES > fallback_bytes:
+        log(f"Download test got no usable data"
+            f"{f' ({exc})' if exc else ''}; retrying with {fallback_bytes // 1_000_000} MB.")
+        fallback_url = f"https://speed.cloudflare.com/__down?bytes={fallback_bytes}"
+        result, exc = _download_once(fallback_url, fallback_bytes)
+        if result:
+            return result
+
+    if exc:
+        log(f"Download test failed: {exc}")
+    else:
         log("Download test produced no usable data.")
-        return None
-    return (read * 8) / elapsed / 1_000_000, read, elapsed
+    return None
 
 
 def measure_upload():
@@ -314,7 +354,7 @@ def measure_upload():
         with request.urlopen(req, timeout=SPEED_TEST_TIMEOUT) as resp:
             resp.read()
         elapsed = time.monotonic() - start
-    except (error.URLError, OSError, ValueError) as exc:
+    except (error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
         log(f"Upload test failed: {exc}")
         return None
 
