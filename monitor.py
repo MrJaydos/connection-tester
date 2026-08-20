@@ -72,6 +72,10 @@ SPEED_TEST = env_bool("SPEED_TEST", True)
 SPEED_TEST_URL = env("SPEED_TEST_URL", "https://speed.cloudflare.com/__down?bytes=100000000")
 SPEED_TEST_BYTES = int(env("SPEED_TEST_BYTES", "100000000"))  # 100 MB
 SPEED_TEST_TIMEOUT = float(env("SPEED_TEST_TIMEOUT", "120"))
+# Cloudflare's __down endpoint rejects very large single requests (HTTP 403), so
+# a big download is fetched as several within-cap requests and summed. This is
+# the max bytes to ask for per request; 25 MB is comfortably under the cap.
+SPEED_TEST_MAX_REQUEST_BYTES = int(env("SPEED_TEST_MAX_REQUEST_BYTES", "25000000"))
 
 # --- Ping (TCP-connect latency) ---
 SPEED_TEST_PING = env_bool("SPEED_TEST_PING", True)
@@ -264,26 +268,29 @@ def measure_ping():
     return sum(times) / len(times), min(times), len(times)
 
 
-def _download_once(url, cap):
+def _download_once(url, cap, deadline):
     """
-    Download up to `cap` bytes from `url`, timing it.
+    Download up to `cap` bytes from `url`, timing only the data transfer.
 
-    Returns (result, error) where result is (mbps, bytes_read, seconds) or None,
-    and error is the exception that stopped us (or None). The stream is read in
-    small chunks and discarded as it arrives -- nothing is written to disk and
-    only one chunk is held in memory at a time, so `cap` can be large.
+    Returns (bytes_read, seconds, error). The stream is read in small chunks and
+    discarded as it arrives -- nothing is written to disk and only one chunk is
+    held in memory at a time. Stops early if the shared `deadline` (monotonic
+    time) passes, so the whole test stays within SPEED_TEST_TIMEOUT.
 
-    A large download is easily interrupted (a connection reset or stall,
-    especially just after the link recovers). Rather than throwing the whole
-    thing away, we measure whatever we managed to pull as long as it's a
-    meaningful sample, and stop once we hit the SPEED_TEST_TIMEOUT time budget.
+    A download can be interrupted (a connection reset or stall, especially just
+    after the link recovers); we return whatever we managed to pull along with
+    the error, so the caller can still use a partial sample.
     """
     read = 0
-    start = time.monotonic()
-    deadline = start + SPEED_TEST_TIMEOUT
     try:
         req = request.Request(url, headers={"User-Agent": "connection-tester/1.0"})
-        with request.urlopen(req, timeout=SPEED_TEST_TIMEOUT) as resp:
+        resp = request.urlopen(req, timeout=SPEED_TEST_TIMEOUT)
+    except (error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+        return 0, 0.0, exc
+
+    start = time.monotonic()  # time the body transfer only, not connect/headers
+    try:
+        with resp:
             while read < cap:
                 chunk = resp.read(min(65536, cap - read))
                 if not chunk:
@@ -292,41 +299,56 @@ def _download_once(url, cap):
                 if time.monotonic() >= deadline:
                     break  # out of time budget -- measure what we've got
     except (error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
-        # Enough for a sample despite the error? Use it. Otherwise report back.
-        if read < 1_000_000:
-            return None, exc
-        log(f"Download test interrupted after {read / 1_000_000:.0f} MB "
-            f"({exc}); using partial sample.")
-
-    elapsed = time.monotonic() - start
-    if read == 0 or elapsed <= 0:
-        return None, None
-    return ((read * 8) / elapsed / 1_000_000, read, elapsed), None
+        return read, time.monotonic() - start, exc
+    return read, time.monotonic() - start, None
 
 
 def measure_download():
     """
     Measure download throughput. Returns (mbps, bytes_read, seconds) or None.
 
-    Tries the configured SPEED_TEST_URL first. Some endpoints reject very large
-    byte counts, so if that yields nothing we retry once with a smaller
-    known-good Cloudflare request rather than reporting "n/a".
+    Fetches SPEED_TEST_BYTES in one or more within-cap requests (Cloudflare's
+    __down endpoint rejects very large single requests), summing the bytes and
+    transfer time. A partial result is fine as long as we got a meaningful
+    sample; only a total washout reports "n/a".
     """
-    result, exc = _download_once(SPEED_TEST_URL, SPEED_TEST_BYTES)
-    if result:
-        return result
+    parts = parse.urlsplit(SPEED_TEST_URL)
+    query = dict(parse.parse_qsl(parts.query))
+    # We can only size a request when the URL carries a `bytes` param (Cloudflare
+    # style). For a fixed-file URL, just fetch it once, capped at the target.
+    can_chunk = "bytes" in query
 
-    fallback_bytes = 25_000_000  # 25 MB
-    if SPEED_TEST_BYTES > fallback_bytes:
-        log(f"Download test got no usable data"
-            f"{f' ({exc})' if exc else ''}; retrying with {fallback_bytes // 1_000_000} MB.")
-        fallback_url = f"https://speed.cloudflare.com/__down?bytes={fallback_bytes}"
-        result, exc = _download_once(fallback_url, fallback_bytes)
-        if result:
-            return result
+    total_read = 0
+    total_elapsed = 0.0
+    last_exc = None
+    deadline = time.monotonic() + SPEED_TEST_TIMEOUT
 
-    if exc:
-        log(f"Download test failed: {exc}")
+    while total_read < SPEED_TEST_BYTES and time.monotonic() < deadline:
+        want = SPEED_TEST_BYTES - total_read
+        if can_chunk:
+            want = min(want, SPEED_TEST_MAX_REQUEST_BYTES)
+            query["bytes"] = str(want)
+            url = parse.urlunsplit(parts._replace(query=parse.urlencode(query)))
+        else:
+            url = SPEED_TEST_URL
+
+        read, elapsed, exc = _download_once(url, want, deadline)
+        total_read += read
+        total_elapsed += elapsed
+        last_exc = exc
+        # Stop on error, or on a short read (server gave less than asked / a
+        # fixed-file URL that can't be resized).
+        if exc is not None or read < want:
+            break
+
+    if total_read >= 1_000_000 and total_elapsed > 0:
+        if last_exc is not None:
+            log(f"Download test interrupted after {total_read / 1_000_000:.0f} MB "
+                f"({last_exc}); using partial sample.")
+        return (total_read * 8) / total_elapsed / 1_000_000, total_read, total_elapsed
+
+    if last_exc is not None:
+        log(f"Download test failed: {last_exc}")
     else:
         log("Download test produced no usable data.")
     return None
