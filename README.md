@@ -10,25 +10,33 @@ down, and that it's back:
 > was down for **4m 27s**,
 > and is now back up and running as of **2026-07-25 14:07:38 BST**.
 
-It can also run a **download speed test the moment the connection returns** and
-send the result as a second message — handy for catching when the link has come
-back on a slower **4G backup** instead of your main line:
+It can also run a **speed test the moment the connection returns** — measuring
+**ping, download and upload** — and send the result as a second message, handy
+for catching when the link has come back on a slower **4G backup** instead of
+your main line:
 
 > 📶 **Speed test after recovery**
 >
-> Download: **12.3 Mbps**
-> (5.0 MB in 3.2s)
+> 🏓 Ping: **11 ms** (min 10 ms)
+> ⬇️ Download: **14.2 Mbps** (100 MB in 56.3s)
+> ⬆️ Upload: **8.1 Mbps** (20 MB in 19.8s)
 >
-> ⚠️ That's below **50 Mbps** — you may be on the 4G backup rather than your main line.
+> ⚠️ That's below **100 Mbps** — you may be on the 4G backup rather than your main line.
 
 (The warning fires below `SPEED_TEST_SLOW_MBPS`, which defaults to `100` — right
 for a fibre main line. Set it to your own speed, or `0` to just get the raw
-number. See the config table below.)
+numbers. See the config table below.)
+
+The download data is **streamed and discarded as it arrives** — nothing is ever
+written to disk, and only a small chunk is held in memory at a time — so the
+100 MB default costs bandwidth but not storage. **Watch your data on 4G:** each
+run uses roughly `SPEED_TEST_BYTES` + `SPEED_TEST_UPLOAD_BYTES` (~120 MB by
+default); lower those two if your backup line is metered.
 
 You can also **message the bot on demand** — send it any of these commands and
 it replies:
 
-- `/speedtest` — run a download speed test right now
+- `/speedtest` — run the full ping/download/upload test right now
 - `/status` — is the connection up at the moment?
 - `/help` — list the commands
 
@@ -142,11 +150,15 @@ docker run -d --restart unless-stopped \
 | `TARGETS`            |    no    | `1.1.1.1:443,8.8.8.8:53` | Comma-separated `host:port` TCP probes. Online = any one connects. |
 | `STARTUP_PING`       |    no    | `true`              | Send a short "monitor is online" message on startup.              |
 | `STATE_FILE`         |    no    | `/data/state.json`  | Where outage state is persisted across restarts.                  |
-| `SPEED_TEST`         |    no    | `true`              | Run a download speed test after recovery and send it as a second message. |
-| `SPEED_TEST_URL`     |    no    | `https://speed.cloudflare.com/__down?bytes=10000000` | File to download for the measurement. |
-| `SPEED_TEST_BYTES`   |    no    | `10000000`          | Hard cap on bytes downloaded (keeps it cheap on metered 4G).       |
-| `SPEED_TEST_TIMEOUT` |    no    | `30`                | Overall timeout for the speed test (seconds).                     |
-| `SPEED_TEST_SLOW_MBPS` |  no    | `100`               | Flag the result as "probably the 4G backup" if below this many Mbps (default suits a fibre line). `0` disables the warning. |
+| `SPEED_TEST`         |    no    | `true`              | Run a ping/download/upload speed test after recovery and send it as a second message. |
+| `SPEED_TEST_URL`     |    no    | `https://speed.cloudflare.com/__down?bytes=100000000` | File to download for the measurement. |
+| `SPEED_TEST_BYTES`   |    no    | `100000000`         | How much to download, in bytes (100 MB). Streamed and discarded — not stored. |
+| `SPEED_TEST_TIMEOUT` |    no    | `120`               | Timeout for each part of the speed test (seconds).                |
+| `SPEED_TEST_PING`    |    no    | `true`              | Include a ping (TCP-connect latency) measurement.                 |
+| `SPEED_TEST_PING_HOST` | no     | `1.1.1.1:443`       | `host:port` to time the TCP connect against for ping.             |
+| `SPEED_TEST_UPLOAD`  |    no    | `true`              | Include an upload measurement (POST to Cloudflare).               |
+| `SPEED_TEST_UPLOAD_BYTES` | no  | `20000000`          | How much to upload, in bytes (20 MB). Generated in memory, then freed. |
+| `SPEED_TEST_SLOW_MBPS` |  no    | `100`               | Flag the download as "probably the 4G backup" if below this many Mbps (default suits a fibre line). `0` disables the warning. |
 | `LISTEN_COMMANDS`    |    no    | `true`              | Reply to `/speedtest`, `/status`, `/help` messaged to the bot (from `TELEGRAM_CHAT_ID` only). |
 
 With the defaults, an outage has to persist for roughly `FAIL_THRESHOLD ×
