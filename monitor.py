@@ -72,6 +72,10 @@ SPEED_TEST_TIMEOUT = float(env("SPEED_TEST_TIMEOUT", "30"))
 # warning (you still get the raw number).
 SPEED_TEST_SLOW_MBPS = float(env("SPEED_TEST_SLOW_MBPS", "100"))
 
+# Listen for Telegram commands (e.g. "/speedtest") and respond on demand.
+# Only messages from TELEGRAM_CHAT_ID are acted on.
+LISTEN_COMMANDS = env_bool("LISTEN_COMMANDS", True)
+
 
 def log(message):
     stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -139,6 +143,30 @@ def telegram_send(text, retries=12, backoff=5):
         if attempt < retries:
             time.sleep(backoff)
     return False
+
+
+def telegram_get_updates(offset=None, timeout=0):
+    """
+    Fetch new messages sent to the bot via the Telegram getUpdates API.
+
+    Returns a list of update objects (possibly empty) or None on error.
+    `offset` acknowledges everything before it; `timeout` enables long polling.
+    """
+    if not BOT_TOKEN:
+        return None
+    params = {"timeout": timeout, "allowed_updates": '["message"]'}
+    if offset is not None:
+        params["offset"] = offset
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?" + parse.urlencode(params)
+    try:
+        with request.urlopen(url, timeout=timeout + 15) as resp:
+            data = json.load(resp)
+        if data.get("ok"):
+            return data.get("result", [])
+        log(f"getUpdates returned not-ok: {data}")
+    except (error.URLError, OSError, ValueError) as exc:
+        log(f"getUpdates failed: {exc}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +250,11 @@ def run_speed_test():
     return mbps, read, elapsed
 
 
-def speed_test_message(result):
+def speed_test_message(result, title="Speed test after recovery"):
     mbps, read, elapsed = result
     megabytes = read / 1_000_000
     text = (
-        "📶 <b>Speed test after recovery</b>\n\n"
+        f"📶 <b>{title}</b>\n\n"
         f"Download: <b>{mbps:.1f} Mbps</b>\n"
         f"({megabytes:.1f} MB in {elapsed:.1f}s)"
     )
@@ -249,6 +277,91 @@ def recovery_message(down_since, back_at):
 
 
 # ---------------------------------------------------------------------------
+# Incoming Telegram commands
+# ---------------------------------------------------------------------------
+SPEED_COMMANDS = {"/speedtest", "/speed", "/test"}
+SPEED_PHRASES = {"speedtest", "speed test", "speed", "test"}
+HELP_COMMANDS = {"/help", "/start"}
+STATUS_COMMANDS = {"/status"}
+
+
+def help_message():
+    return (
+        "🤖 <b>Connection monitor</b>\n\n"
+        "Commands:\n"
+        "• /speedtest — run a download speed test now\n"
+        "• /status — is the connection up right now?\n"
+        "• /help — show this message\n\n"
+        "You'll also get an automatic message whenever the connection drops and "
+        "recovers (with a speed test, to flag the 4G backup)."
+    )
+
+
+def status_message(down_since):
+    now = datetime.now().astimezone()
+    if down_since:
+        return (
+            "🔴 <b>Internet is currently down</b>\n\n"
+            f"Down since {fmt(down_since)} ({human_duration(now - down_since)} ago)."
+        )
+    return f"🟢 <b>Internet is up</b>\nAs of {fmt(now)}."
+
+
+def run_command_speed_test():
+    """Run an on-demand speed test and reply with the result."""
+    log("Received /speedtest command.")
+    telegram_send("⏳ Running a speed test, one moment...", retries=2, backoff=3)
+    result = run_speed_test()
+    if result:
+        log(f"On-demand speed test: {result[0]:.1f} Mbps.")
+        telegram_send(speed_test_message(result, title="Speed test"))
+    else:
+        telegram_send("⚠️ Speed test could not be completed. Please try again in a moment.")
+
+
+def handle_command(text, down_since):
+    """Act on a single incoming message's text. Unknown messages are ignored."""
+    words = text.strip().lower().split()
+    if not words:
+        return
+    # Normalise "/speedtest@YourBot" -> "/speedtest".
+    first = words[0].split("@", 1)[0]
+    phrase = " ".join([first] + words[1:])
+
+    if first in SPEED_COMMANDS or phrase in SPEED_PHRASES:
+        run_command_speed_test()
+    elif first in STATUS_COMMANDS or phrase == "status":
+        telegram_send(status_message(down_since))
+    elif first in HELP_COMMANDS or phrase == "help":
+        telegram_send(help_message())
+    # Anything else: stay quiet so we don't spam on normal chatter.
+
+
+def process_commands(offset, down_since):
+    """
+    Poll Telegram for new messages and act on any recognised commands.
+
+    Only messages from the configured CHAT_ID are honoured. Returns the new
+    offset to pass on the next call.
+    """
+    updates = telegram_get_updates(offset)
+    if not updates:
+        return offset
+    for upd in updates:
+        offset = upd["update_id"] + 1
+        msg = upd.get("message") or {}
+        text = msg.get("text", "")
+        chat = str(msg.get("chat", {}).get("id", ""))
+        if not text:
+            continue
+        if CHAT_ID and chat != str(CHAT_ID):
+            log(f"Ignoring command from unauthorized chat {chat}.")
+            continue
+        handle_command(text, down_since)
+    return offset
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 def main():
@@ -260,6 +373,8 @@ def main():
             f"from {SPEED_TEST_URL}).")
     else:
         log("Post-recovery speed test: off.")
+    if LISTEN_COMMANDS:
+        log("Command listener: on (/speedtest, /status, /help).")
 
     if not BOT_TOKEN or not CHAT_ID:
         log("WARNING: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID are not set. "
@@ -275,13 +390,22 @@ def main():
         if telegram_send(
             "✅ <b>Connection monitor is online</b>\n"
             f"Watching your internet as of {fmt(now)}.\n"
-            "You'll get a message here if it drops and recovers.",
+            "You'll get a message here if it drops and recovers.\n"
+            "Send /speedtest any time to check your speed, or /help for commands.",
             retries=2,
             backoff=3,
         ):
             log("Startup ping sent to Telegram.")
         else:
             log("Startup ping could not be sent (check token / chat id / connectivity).")
+
+    # Skip any commands that queued up while we were offline/restarting, so a
+    # restart doesn't replay old "/speedtest" messages.
+    update_offset = None
+    if LISTEN_COMMANDS and BOT_TOKEN and CHAT_ID:
+        recent = telegram_get_updates(offset=-1)
+        if recent:
+            update_offset = recent[-1]["update_id"] + 1
 
     consecutive_fails = 0
     first_fail_at = None
@@ -327,6 +451,11 @@ def main():
                 save_down_since(down_since)
                 log(f"DISCONNECTED. Internet down since {fmt(down_since)} "
                     f"({consecutive_fails} consecutive failed checks).")
+
+        # Check for any commands you've messaged the bot (e.g. /speedtest).
+        # Only works while we're online -- there's no route out during an outage.
+        if LISTEN_COMMANDS and BOT_TOKEN and CHAT_ID and online:
+            update_offset = process_commands(update_offset, down_since)
 
         time.sleep(INTERVAL_SECONDS)
 

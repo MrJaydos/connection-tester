@@ -25,6 +25,8 @@ services:
       # Fibre line ~500+ Mbps, so anything under 100 Mbps is almost certainly
       # the 4G backup -- flag it. Bump this up if you ever want a stricter check.
       SPEED_TEST_SLOW_MBPS: "100"
+      # Reply to commands you message the bot: /speedtest, /status, /help.
+      LISTEN_COMMANDS: "true"
     volumes:
       - tester-data:/data
 
