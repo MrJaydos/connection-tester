@@ -38,7 +38,14 @@ it replies:
 
 - `/speedtest` — run the full ping/download/upload test right now
 - `/status` — is the connection up at the moment?
+- `/stop` — pause up/down alerts (handy when the line is flapping and spamming you)
+- `/start` — resume up/down alerts
 - `/help` — list the commands
+
+Pausing with `/stop` silences the automatic drop/recovery alerts (and their
+speed test) while still answering `/speedtest` and `/status`. The paused state is
+remembered across restarts, so a redeploy won't quietly turn alerts back on —
+send `/start` when you want them again.
 
 (Only messages from your `TELEGRAM_CHAT_ID` are acted on; anything else is
 ignored. Commands only work while you're online — during an outage the box has
@@ -160,7 +167,8 @@ docker run -d --restart unless-stopped \
 | `SPEED_TEST_UPLOAD`  |    no    | `true`              | Include an upload measurement (POST to Cloudflare).               |
 | `SPEED_TEST_UPLOAD_BYTES` | no  | `20000000`          | How much to upload, in bytes (20 MB). Generated in memory, then freed. |
 | `SPEED_TEST_SLOW_MBPS` |  no    | `100`               | Flag the download as "probably the 4G backup" if below this many Mbps (default suits a fibre line). `0` disables the warning. |
-| `LISTEN_COMMANDS`    |    no    | `true`              | Reply to `/speedtest`, `/status`, `/help` messaged to the bot (from `TELEGRAM_CHAT_ID` only). |
+| `LISTEN_COMMANDS`    |    no    | `true`              | Reply to `/speedtest`, `/status`, `/stop`, `/start`, `/help` messaged to the bot (from `TELEGRAM_CHAT_ID` only). |
+| `PAUSED_FILE`        |    no    | `/data/paused`      | Marker file for the `/stop` pause state; persists across restarts. |
 
 With the defaults, an outage has to persist for roughly `FAIL_THRESHOLD ×
 INTERVAL_SECONDS` (≈ 15s) before it's counted — tune those down for a twitchier
