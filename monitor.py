@@ -57,6 +57,13 @@ CHECK_TIMEOUT = float(env("CHECK_TIMEOUT", "1.5"))
 FAIL_THRESHOLD = int(env("FAIL_THRESHOLD", "3"))
 STATE_FILE = env("STATE_FILE", "/data/state.json")
 STARTUP_PING = env_bool("STARTUP_PING", True)
+# Marker file: while it exists, monitoring is paused (no up/down alerts). Toggled
+# by the /stop and /start Telegram commands and persisted so a restart keeps the
+# chosen state.
+PAUSED_FILE = env("PAUSED_FILE", "/data/paused")
+
+# Mutable runtime state, toggled by incoming Telegram commands.
+runtime = {"paused": False}
 
 # After the connection recovers, measure your connection (ping, download and
 # upload). Handy for spotting when you've dropped onto a slower 4G backup line
@@ -218,6 +225,28 @@ def clear_state():
         os.remove(STATE_FILE)
     except OSError:
         pass
+
+
+def load_paused():
+    """Whether monitoring was left paused (marker file present)."""
+    return os.path.exists(PAUSED_FILE)
+
+
+def set_paused(value):
+    """Pause or resume monitoring, persisting the choice across restarts."""
+    runtime["paused"] = value
+    try:
+        if value:
+            os.makedirs(os.path.dirname(PAUSED_FILE) or ".", exist_ok=True)
+            with open(PAUSED_FILE, "w") as fh:
+                fh.write("paused\n")
+        else:
+            try:
+                os.remove(PAUSED_FILE)
+            except OSError:
+                pass
+    except OSError as exc:
+        log(f"Could not persist pause state to {PAUSED_FILE}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +493,9 @@ def recovery_message(down_since, back_at):
 # ---------------------------------------------------------------------------
 SPEED_COMMANDS = {"/speedtest", "/speed", "/test"}
 SPEED_PHRASES = {"speedtest", "speed test", "speed", "test"}
-HELP_COMMANDS = {"/help", "/start"}
+STOP_COMMANDS = {"/stop", "/pause"}
+START_COMMANDS = {"/start", "/resume"}
+HELP_COMMANDS = {"/help"}
 STATUS_COMMANDS = {"/status"}
 
 
@@ -472,22 +503,29 @@ def help_message():
     return (
         "🤖 <b>Connection monitor</b>\n\n"
         "Commands:\n"
-        "• /speedtest — run a download speed test now\n"
+        "• /speedtest — run a speed test now\n"
         "• /status — is the connection up right now?\n"
+        "• /stop — pause up/down alerts\n"
+        "• /start — resume up/down alerts\n"
         "• /help — show this message\n\n"
         "You'll also get an automatic message whenever the connection drops and "
-        "recovers (with a speed test, to flag the 4G backup)."
+        "recovers (with a speed test, to flag the 4G backup) — unless paused."
     )
 
 
 def status_message(down_since):
     now = datetime.now().astimezone()
+    if runtime["paused"]:
+        head = "⏸️ <b>Monitoring is paused</b> (send /start to resume).\n\n"
+    else:
+        head = ""
     if down_since:
         return (
+            head +
             "🔴 <b>Internet is currently down</b>\n\n"
             f"Down since {fmt(down_since)} ({human_duration(now - down_since)} ago)."
         )
-    return f"🟢 <b>Internet is up</b>\nAs of {fmt(now)}."
+    return head + f"🟢 <b>Internet is up</b>\nAs of {fmt(now)}."
 
 
 def run_command_speed_test():
@@ -513,6 +551,27 @@ def handle_command(text, down_since):
 
     if first in SPEED_COMMANDS or phrase in SPEED_PHRASES:
         run_command_speed_test()
+    elif first in STOP_COMMANDS or phrase in ("stop", "pause"):
+        if runtime["paused"]:
+            telegram_send("⏸️ Monitoring is already paused. Send /start to resume.")
+        else:
+            set_paused(True)
+            log("Monitoring paused via /stop command.")
+            telegram_send(
+                "⏸️ <b>Monitoring paused.</b>\n"
+                "No more up/down alerts until you send /start.\n"
+                "(/speedtest and /status still work.)"
+            )
+    elif first in START_COMMANDS or phrase in ("start", "resume"):
+        if not runtime["paused"]:
+            telegram_send("▶️ Monitoring is already running. Send /stop to pause.")
+        else:
+            set_paused(False)
+            log("Monitoring resumed via /start command.")
+            telegram_send(
+                "▶️ <b>Monitoring resumed.</b>\n"
+                "You'll get up/down alerts again."
+            )
     elif first in STATUS_COMMANDS or phrase == "status":
         telegram_send(status_message(down_since))
     elif first in HELP_COMMANDS or phrase == "help":
@@ -562,24 +621,30 @@ def main():
     else:
         log("Post-recovery speed test: off.")
     if LISTEN_COMMANDS:
-        log("Command listener: on (/speedtest, /status, /help).")
+        log("Command listener: on (/speedtest, /status, /stop, /start, /help).")
 
     if not BOT_TOKEN or not CHAT_ID:
         log("WARNING: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID are not set. "
             "The monitor will run but cannot send alerts until they are configured.")
+
+    # Restore whether monitoring was left paused (via /stop) before a restart.
+    runtime["paused"] = load_paused()
+    if runtime["paused"]:
+        log("Monitoring is PAUSED (from persisted state). Send /start to resume.")
 
     # Resume an outage that was in progress when the container last stopped.
     down_since = load_down_since()
     if down_since:
         log(f"Resuming: an outage was in progress since {fmt(down_since)} (from state file).")
 
-    if STARTUP_PING and BOT_TOKEN and CHAT_ID:
+    if STARTUP_PING and BOT_TOKEN and CHAT_ID and not runtime["paused"]:
         now = datetime.now().astimezone()
         if telegram_send(
             "✅ <b>Connection monitor is online</b>\n"
             f"Watching your internet as of {fmt(now)}.\n"
             "You'll get a message here if it drops and recovers.\n"
-            "Send /speedtest any time to check your speed, or /help for commands.",
+            "Send /speedtest to check your speed, /stop to pause alerts, "
+            "or /help for commands.",
             retries=2,
             backoff=3,
         ):
@@ -599,6 +664,14 @@ def main():
     first_fail_at = None
 
     while True:
+        # While paused (via /stop), don't monitor or send alerts -- just keep
+        # listening for commands so /start can bring it back.
+        if runtime["paused"]:
+            if LISTEN_COMMANDS and BOT_TOKEN and CHAT_ID:
+                update_offset = process_commands(update_offset, down_since)
+            time.sleep(INTERVAL_SECONDS)
+            continue
+
         online = is_online()
         now = datetime.now().astimezone()
 
